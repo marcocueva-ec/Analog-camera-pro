@@ -13,6 +13,7 @@ import android.media.Image
 import android.media.ImageReader
 import android.media.MediaActionSound
 import android.media.MediaRecorder
+import android.net.Uri
 import android.os.*
 import android.provider.MediaStore
 import android.util.Range
@@ -89,7 +90,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun AnalogProRoot() {
     val context = LocalContext.current
-    var hasPermissions by remember {
+    var hasCameraPerm by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         )
@@ -98,27 +99,32 @@ fun AnalogProRoot() {
     val permLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { perms ->
-        hasPermissions = perms[Manifest.permission.CAMERA] == true
+        hasCameraPerm = perms[Manifest.permission.CAMERA] == true ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
     }
 
+    // Solicitar siempre permisos de Cámara, Audio y Galería (Fotos y Videos)
     LaunchedEffect(Unit) {
-        if (!hasPermissions) {
-            val list = mutableListOf(
-                Manifest.permission.CAMERA,
-                Manifest.permission.RECORD_AUDIO
-            )
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                list.add(Manifest.permission.READ_MEDIA_IMAGES)
-                list.add(Manifest.permission.READ_MEDIA_VIDEO)
-            } else {
-                list.add(Manifest.permission.READ_EXTERNAL_STORAGE)
-                list.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-            }
-            permLauncher.launch(list.toTypedArray())
+        val needed = mutableListOf(
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            needed.add(Manifest.permission.READ_MEDIA_IMAGES)
+            needed.add(Manifest.permission.READ_MEDIA_VIDEO)
+        } else {
+            needed.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+            needed.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }
+        val missing = needed.filter {
+            ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) {
+            permLauncher.launch(missing.toTypedArray())
         }
     }
 
-    if (hasPermissions) {
+    if (hasCameraPerm) {
         CinemaCameraScreen()
     } else {
         Box(
@@ -128,7 +134,7 @@ fun AnalogProRoot() {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text("ANALOG PRO CINEMA", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(10.dp))
-                Text("Concede permiso de Cámara y Micrófono para continuar", color = Color.Gray, fontSize = 13.sp)
+                Text("Concede permiso de Cámara para continuar", color = Color.Gray, fontSize = 13.sp)
             }
         }
     }
@@ -141,7 +147,6 @@ fun CinemaCameraScreen() {
     val scope = rememberCoroutineScope()
     val cameraManager = remember { context.getSystemService(Context.CAMERA_SERVICE) as CameraManager }
 
-    // Sonidos nativos de cámara (Foto, Inicio de Video y Corte de Video)
     val mediaActionSound = remember {
         MediaActionSound().apply {
             load(MediaActionSound.SHUTTER_CLICK)
@@ -153,7 +158,6 @@ fun CinemaCameraScreen() {
         onDispose { mediaActionSound.release() }
     }
 
-    // 1. Rotación fluida de iconos manteniendo la plantilla fija tal cual
     var isDeviceLandscape by remember { mutableStateOf(false) }
     var uiRotationDeg by remember { mutableStateOf(0f) }
     val animatedIconRotation by animateFloatAsState(targetValue = uiRotationDeg, label = "iconRot")
@@ -186,7 +190,6 @@ fun CinemaCameraScreen() {
         onDispose { listener.disable() }
     }
 
-    // 2. Inventario de sensores y lentes físicos
     val availableLenses = remember {
         val list = ArrayList<LensCameraInfo>()
         try {
@@ -216,8 +219,10 @@ fun CinemaCameraScreen() {
                 val maxJpeg = map?.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
                 val maxRaw = if (supportsRaw) map?.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width * it.height } else null
                 val videoSizes = map?.getOutputSizes(MediaRecorder::class.java) ?: emptyArray()
-                val maxVideo = videoSizes.filter { it.width <= 3840 && it.height <= 2160 }
-                    .maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
+                // Elegir resolución de video 16:9 estándar compatible con todos los codificadores H.264
+                val maxVideo = videoSizes.firstOrNull { it.width == 1920 && it.height == 1080 }
+                    ?: videoSizes.filter { it.width <= 1920 && it.height <= 1080 }.maxByOrNull { it.width * it.height }
+                    ?: Size(1280, 720)
 
                 val mp = String.format(Locale.US, "%.1f MP (%dx%d)", (maxJpeg.width * maxJpeg.height) / 1_000_000f, maxJpeg.width, maxJpeg.height)
                 val physSize = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
@@ -287,7 +292,6 @@ fun CinemaCameraScreen() {
         mutableStateOf(availableLenses.firstOrNull { !it.isFront } ?: availableLenses.first())
     }
 
-    // 3. Estado de Formato (Solo 16:9 y 4:3, sin Open Gate), Films, VFX y PRO
     var aspectMode by remember { mutableStateOf(AspectRatioMode.RATIO_16_9) }
     var activeDockTab by remember { mutableStateOf(DockTab.NONE) }
 
@@ -303,7 +307,6 @@ fun CinemaCameraScreen() {
     var flashMode by remember { mutableStateOf(FlashMode.OFF) }
     var flashStrengthPercent by remember { mutableStateOf(0.8f) }
 
-    // Zoom táctil, Enfoque táctil con mini barra de exposición a la derecha, y Detección Facial
     var currentZoom by remember { mutableStateOf(1.0f) }
     var focusNormX by remember { mutableStateOf(0.5f) }
     var focusNormY by remember { mutableStateOf(0.5f) }
@@ -311,7 +314,6 @@ fun CinemaCameraScreen() {
     var lastFocusTouchMillis by remember { mutableStateOf(0L) }
     val detectedFacesNorm = remember { mutableStateListOf<RectF>() }
 
-    // Ocultar automáticamente la mini barra de exposición 3.5s después de dejar de ajustar
     LaunchedEffect(lastFocusTouchMillis) {
         if (lastFocusTouchMillis > 0L) {
             delay(3500L)
@@ -322,13 +324,12 @@ fun CinemaCameraScreen() {
     var sceneLight by remember { mutableStateOf(SceneLightAnalysis()) }
     var lowLightPromptDismissed by remember { mutableStateOf(false) }
 
-    // Video Recording y Timecode central
     var isRecordingVideo by remember { mutableStateOf(false) }
     var recordingSeconds by remember { mutableStateOf(0) }
     var mediaRecorderRef by remember { mutableStateOf<MediaRecorder?>(null) }
     var pendingVideoPfd by remember { mutableStateOf<ParcelFileDescriptor?>(null) }
+    var currentRecordingUri by remember { mutableStateOf<Uri?>(null) }
 
-    // Galería Persistente
     val persistedMedia = remember { mutableStateListOf<PersistedMediaItem>() }
     var latestThumbnailBmp by remember { mutableStateOf<Bitmap?>(null) }
     var showGalleryScreen by remember { mutableStateOf(false) }
@@ -379,6 +380,7 @@ fun CinemaCameraScreen() {
 
     var cameraDevice by remember { mutableStateOf<CameraDevice?>(null) }
     var captureSession by remember { mutableStateOf<CameraCaptureSession?>(null) }
+    var activePreviewSurface by remember { mutableStateOf<Surface?>(null) }
     var jpegReader by remember { mutableStateOf<ImageReader?>(null) }
     var rawReader by remember { mutableStateOf<ImageReader?>(null) }
     var currentCharacteristics by remember { mutableStateOf<CameraCharacteristics?>(null) }
@@ -386,10 +388,6 @@ fun CinemaCameraScreen() {
     var viewBoxSize by remember { mutableStateOf(IntSize(1080, 1920)) }
     var previewBufferSize by remember { mutableStateOf(Size(1920, 1080)) }
 
-    /**
-     * Calcula la matriz del TextureView considerando la orientación exacta del sensor
-     * (frontal o trasero) para eliminar por completo cualquier deformación.
-     */
     fun applyNonDistortingTransform(texView: TextureView, viewW: Int, viewH: Int, bufSize: Size, lens: LensCameraInfo) {
         if (viewW <= 0 || viewH <= 0) return
         val swapped = (lens.sensorOrientation == 90 || lens.sensorOrientation == 270)
@@ -414,7 +412,6 @@ fun CinemaCameraScreen() {
         texView.setTransform(matrix)
     }
 
-    // Callback que recibe las caras detectadas por el ISP de la cámara en tiempo real
     val previewCaptureCallback = remember(activeLens) {
         object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureCompleted(
@@ -424,15 +421,10 @@ fun CinemaCameraScreen() {
             ) {
                 val faces = result.get(CaptureResult.STATISTICS_FACES)
                 val activeArray = currentCharacteristics?.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-                if (faces != null && activeArray != null && activeArray.width() > 0 && activeArray.height() > 0) {
+                if (faces != null && faces.isNotEmpty() && activeArray != null && activeArray.width() > 0 && activeArray.height() > 0) {
                     val mapped = faces.take(5).map { face ->
                         val b = face.bounds
-                        // Mapear coordenadas del sensor al visor vertical (0..1)
-                        val nx = if (activeLens.isFront) {
-                            1f - (b.centerY().toFloat() / activeArray.height().toFloat())
-                        } else {
-                            1f - (b.centerY().toFloat() / activeArray.height().toFloat())
-                        }
+                        val nx = 1f - (b.centerY().toFloat() / activeArray.height().toFloat())
                         val ny = if (activeLens.isFront) {
                             1f - (b.centerX().toFloat() / activeArray.width().toFloat())
                         } else {
@@ -459,29 +451,25 @@ fun CinemaCameraScreen() {
     fun applyRepeatingPreviewParameters(
         cam: CameraDevice,
         session: CameraCaptureSession,
-        texView: TextureView,
         triggerAfPoint: Offset? = null
     ) {
-        val surfaceTexture = texView.surfaceTexture ?: return
+        val previewSurface = activePreviewSurface ?: return
         val chars = currentCharacteristics ?: return
         try {
             val template = if (isRecordingVideo) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
             val req = cam.createCaptureRequest(template).apply {
-                addTarget(Surface(surfaceTexture))
+                addTarget(previewSurface)
                 if (isRecordingVideo) {
                     mediaRecorderRef?.surface?.let { addTarget(it) }
                 }
 
-                // Máxima fidelidad cromática y nitidez del ISP
                 set(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY)
 
-                // Activar Detección Facial por hardware si el sensor lo soporta
                 val faceModes = chars.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES) ?: intArrayOf()
                 if (faceModes.contains(CaptureRequest.STATISTICS_FACE_DETECT_MODE_SIMPLE)) {
                     set(CaptureRequest.STATISTICS_FACE_DETECT_MODE, CaptureRequest.STATISTICS_FACE_DETECT_MODE_SIMPLE)
                 }
 
-                // Zoom en Foto y Video
                 val activeArray = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     set(CaptureRequest.CONTROL_ZOOM_RATIO, currentZoom)
@@ -493,7 +481,6 @@ fun CinemaCameraScreen() {
                     set(CaptureRequest.SCALER_CROP_REGION, Rect(cropX, cropY, cropX + cropW, cropY + cropH))
                 }
 
-                // Enfoque Táctil donde se toque en pantalla
                 set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                 if (activeArray != null) {
                     val meterW = (activeArray.width() * 0.14f).toInt().coerceAtLeast(100)
@@ -511,7 +498,6 @@ fun CinemaCameraScreen() {
                     set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(rect))
                 }
 
-                // Exposición Manual (PRO) o Automática con Compensación EV (barra lateral de enfoque)
                 if (isManualMode && activeLens.supportsManualSensor) {
                     set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
                     set(CaptureRequest.SENSOR_SENSITIVITY, selectedIso.coerceIn(activeLens.isoRange.lower, activeLens.isoRange.upper))
@@ -527,15 +513,8 @@ fun CinemaCameraScreen() {
                     set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, totalEv)
                 }
 
-                if (flashMode == FlashMode.TORCH && activeLens.hasFlash) {
+                if ((flashMode == FlashMode.TORCH || (isRecordingVideo && flashMode != FlashMode.OFF)) && activeLens.hasFlash) {
                     set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_TORCH)
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && activeLens.maxFlashStrengthLevel > 1) {
-                        try {
-                            val level = (flashStrengthPercent * activeLens.maxFlashStrengthLevel).toInt()
-                                .coerceIn(1, activeLens.maxFlashStrengthLevel)
-                            cameraManager.turnOnTorchWithStrengthLevel(activeLens.cameraId, level)
-                        } catch (_: Exception) {}
-                    }
                 } else {
                     set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
                 }
@@ -545,7 +524,7 @@ fun CinemaCameraScreen() {
                 }
             }
             session.setRepeatingRequest(req.build(), previewCaptureCallback, Handler(Looper.getMainLooper()))
-        } catch (_: Exception) {}
+        } catch (_: Throwable) {}
     }
 
     fun openSelectedCamera(lens: LensCameraInfo, texView: TextureView) {
@@ -582,6 +561,7 @@ fun CinemaCameraScreen() {
                     applyNonDistortingTransform(texView, texView.width, texView.height, chosenPreview, lens)
 
                     val previewSurface = Surface(st)
+                    activePreviewSurface = previewSurface
                     val targets = mutableListOf(previewSurface)
                     jpegReader?.surface?.let { targets.add(it) }
                     rawReader?.surface?.let { targets.add(it) }
@@ -589,7 +569,7 @@ fun CinemaCameraScreen() {
                     camera.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
                         override fun onConfigured(session: CameraCaptureSession) {
                             captureSession = session
-                            applyRepeatingPreviewParameters(camera, session, texView)
+                            applyRepeatingPreviewParameters(camera, session)
                         }
                         override fun onConfigureFailed(session: CameraCaptureSession) {}
                     }, null)
@@ -609,8 +589,7 @@ fun CinemaCameraScreen() {
     ) {
         val cam = cameraDevice ?: return@LaunchedEffect
         val session = captureSession ?: return@LaunchedEffect
-        val tex = textureViewRef.value ?: return@LaunchedEffect
-        applyRepeatingPreviewParameters(cam, session, tex)
+        applyRepeatingPreviewParameters(cam, session)
     }
 
     LaunchedEffect(aspectMode, viewBoxSize, previewBufferSize, activeLens) {
@@ -618,7 +597,6 @@ fun CinemaCameraScreen() {
         applyNonDistortingTransform(tex, tex.width, tex.height, previewBufferSize, activeLens)
     }
 
-    // Aplicar el Film / LUT en TIEMPO REAL directamente sobre el TextureView (en Foto y Video)
     LaunchedEffect(selectedPreset, activeLens, exposureEvSteps, vfxConfig.temperature, vfxConfig.tint) {
         val tex = textureViewRef.value ?: return@LaunchedEffect
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -640,14 +618,15 @@ fun CinemaCameraScreen() {
         }
     }
 
-    // Analizador de escena en tiempo real (Flares solares, Anamórficos y alerta de Baja Luz)
-    LaunchedEffect(Unit) {
+    // Analizador pausado mientras la galería está abierta
+    LaunchedEffect(showGalleryScreen) {
         while (isActive) {
-            delay(120L)
+            delay(140L)
+            if (showGalleryScreen) continue
             val tex = textureViewRef.value
             if (tex != null && tex.isAvailable) {
                 val tinyBmp = withContext(Dispatchers.Main) {
-                    try { tex.getBitmap(64, 64) } catch (_: Exception) { null }
+                    try { tex.getBitmap(64, 64) } catch (_: Throwable) { null }
                 }
                 if (tinyBmp != null) {
                     val analysis = withContext(Dispatchers.Default) {
@@ -660,7 +639,6 @@ fun CinemaCameraScreen() {
         }
     }
 
-    // Grabación de Video en máxima calidad con sonido de inicio y corte
     fun toggleVideoRecording() {
         val cam = cameraDevice ?: return
         val texView = textureViewRef.value ?: return
@@ -668,16 +646,18 @@ fun CinemaCameraScreen() {
 
         if (isRecordingVideo) {
             mediaActionSound.play(MediaActionSound.STOP_VIDEO_RECORDING)
-            try { mediaRecorderRef?.stop() } catch (_: Exception) {}
-            try { mediaRecorderRef?.release() } catch (_: Exception) {}
+            try { mediaRecorderRef?.stop() } catch (_: Throwable) {}
+            try { mediaRecorderRef?.release() } catch (_: Throwable) {}
             mediaRecorderRef = null
-            try { pendingVideoPfd?.close() } catch (_: Exception) {}
+            try { pendingVideoPfd?.close() } catch (_: Throwable) {}
             pendingVideoPfd = null
+            currentRecordingUri = null
             isRecordingVideo = false
             refreshGalleryFromMediaStore()
-            Toast.makeText(context, "Video guardado en la Galería de la App", Toast.LENGTH_SHORT).show()
+            Toast.makeText(context, "Video guardado en la Galería", Toast.LENGTH_SHORT).show()
             openSelectedCamera(activeLens, texView)
         } else {
+            var createdUri: Uri? = null
             try {
                 val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                 val values = ContentValues().apply {
@@ -688,9 +668,12 @@ fun CinemaCameraScreen() {
                     }
                 }
                 val videoUri = context.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return
+                createdUri = videoUri
+                currentRecordingUri = videoUri
                 val pfd = context.contentResolver.openFileDescriptor(videoUri, "w") ?: return
                 pendingVideoPfd = pfd
 
+                val hasAudioPerm = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
                 val vidSize = activeLens.maxVideoSize
                 val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     MediaRecorder(context)
@@ -700,17 +683,21 @@ fun CinemaCameraScreen() {
                 }
 
                 recorder.apply {
-                    setAudioSource(MediaRecorder.AudioSource.MIC)
+                    if (hasAudioPerm) {
+                        setAudioSource(MediaRecorder.AudioSource.MIC)
+                    }
                     setVideoSource(MediaRecorder.VideoSource.SURFACE)
                     setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
                     setOutputFile(pfd.fileDescriptor)
-                    setVideoEncodingBitRate(42_000_000) // 42 Mbps máxima calidad
+                    setVideoEncodingBitRate(24_000_000)
                     setVideoFrameRate(30)
                     setVideoSize(vidSize.width, vidSize.height)
                     setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-                    setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                    setAudioEncodingBitRate(192_000)
-                    setAudioSamplingRate(48_000)
+                    if (hasAudioPerm) {
+                        setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                        setAudioEncodingBitRate(128_000)
+                        setAudioSamplingRate(44_100)
+                    }
                     val hint = if (activeLens.isFront) {
                         if (isDeviceLandscape) 0 else 270
                     } else {
@@ -722,6 +709,7 @@ fun CinemaCameraScreen() {
 
                 mediaRecorderRef = recorder
                 val previewSurface = Surface(st)
+                activePreviewSurface = previewSurface
                 val recordSurface = recorder.surface
 
                 cam.createCaptureSession(
@@ -731,29 +719,31 @@ fun CinemaCameraScreen() {
                             captureSession = session
                             isRecordingVideo = true
                             mediaActionSound.play(MediaActionSound.START_VIDEO_RECORDING)
-                            applyRepeatingPreviewParameters(cam, session, texView)
+                            applyRepeatingPreviewParameters(cam, session)
                             try {
                                 recorder.start()
-                            } catch (e: Exception) {
+                            } catch (t: Throwable) {
                                 isRecordingVideo = false
+                                createdUri?.let { context.contentResolver.delete(it, null, null) }
                             }
                         }
-                        override fun onConfigureFailed(session: CameraCaptureSession) {}
+                        override fun onConfigureFailed(session: CameraCaptureSession) {
+                            createdUri?.let { context.contentResolver.delete(it, null, null) }
+                            Toast.makeText(context, "Error iniciando sesión de video", Toast.LENGTH_SHORT).show()
+                        }
                     },
                     null
                 )
-            } catch (e: Exception) {
-                Toast.makeText(context, "Error de video: ${e.message}", Toast.LENGTH_SHORT).show()
+            } catch (t: Throwable) {
+                createdUri?.let {
+                    try { context.contentResolver.delete(it, null, null) } catch (_: Throwable) {}
+                }
+                Toast.makeText(context, "No se pudo grabar video: ${t.message}", Toast.LENGTH_SHORT).show()
             }
         }
     }
 
-    /**
-     * Disparo Fotográfico en Máxima Resolución Nativa del Sensor (Frontal y Trasero)
-     * eliminando por completo cualquier deformación y guardando la Metadata EXIF.
-     */
     fun capturePhoto() {
-        val texView = textureViewRef.value ?: return
         val chars = currentCharacteristics ?: return
         if (isCapturingPhoto) return
         isCapturingPhoto = true
@@ -765,49 +755,6 @@ fun CinemaCameraScreen() {
                 val dateLabel = SimpleDateFormat("dd.MM.yyyy", Locale.US).format(Date())
                 val lens = activeLens
 
-                // 1. Captura RAW (.DNG 16-bit) si fue elegida
-                if ((captureFormat == CaptureFormat.RAW || captureFormat == CaptureFormat.RAW_JPG) && lens.supportsRaw && rawReader != null) {
-                    val cam = cameraDevice
-                    val session = captureSession
-                    if (cam != null && session != null) {
-                        var lastRes: TotalCaptureResult? = null
-                        val rawReq = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                            addTarget(rawReader!!.surface)
-                        }
-                        rawReader?.setOnImageAvailableListener({ reader ->
-                            val img: Image? = reader.acquireLatestImage()
-                            val r = lastRes
-                            if (img != null && r != null) {
-                                val dngValues = ContentValues().apply {
-                                    put(MediaStore.Images.Media.DISPLAY_NAME, "ANALOG_${timestamp}.dng")
-                                    put(MediaStore.Images.Media.MIME_TYPE, "image/x-adobe-dng")
-                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                                        put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/AnalogPro/RAW")
-                                    }
-                                }
-                                val dngUri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, dngValues)
-                                if (dngUri != null) {
-                                    context.contentResolver.openOutputStream(dngUri)?.use { out ->
-                                        val creator = DngCreator(chars, r)
-                                        creator.writeImage(out, img)
-                                        creator.close()
-                                    }
-                                }
-                                img.close()
-                            } else {
-                                img?.close()
-                            }
-                        }, Handler(Looper.getMainLooper()))
-
-                        session.capture(rawReq.build(), object : CameraCaptureSession.CaptureCallback() {
-                            override fun onCaptureCompleted(s: CameraCaptureSession, req: CaptureRequest, result: TotalCaptureResult) {
-                                lastRes = result
-                            }
-                        }, Handler(Looper.getMainLooper()))
-                    }
-                }
-
-                // 2. Captura en Máxima Resolución desde el ImageReader JPEG (100% calidad ISP, Cero Deformación)
                 var highResCleanBitmap: Bitmap? = null
                 val cam = cameraDevice
                 val session = captureSession
@@ -852,9 +799,15 @@ fun CinemaCameraScreen() {
                                     set(CaptureRequest.SENSOR_SENSITIVITY, selectedIso)
                                     set(CaptureRequest.SENSOR_EXPOSURE_TIME, selectedShutterNs)
                                 } else {
+                                    val aeMode = when (flashMode) {
+                                        FlashMode.AUTO -> CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH
+                                        FlashMode.ON, FlashMode.DISPOSABLE -> CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH
+                                        else -> CaptureRequest.CONTROL_AE_MODE_ON
+                                    }
+                                    set(CaptureRequest.CONTROL_AE_MODE, aeMode)
                                     set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, exposureEvSteps)
                                 }
-                                if (flashMode == FlashMode.ON || flashMode == FlashMode.DISPOSABLE) {
+                                if (flashMode == FlashMode.ON || flashMode == FlashMode.DISPOSABLE || flashMode == FlashMode.TORCH) {
                                     set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_SINGLE)
                                 }
                             }
@@ -863,14 +816,19 @@ fun CinemaCameraScreen() {
                     }
 
                     if (rawJpegBytes != null) {
-                        val decoded = try {
-                            BitmapFactory.decodeByteArray(rawJpegBytes, 0, rawJpegBytes.size)
-                        } catch (_: OutOfMemoryError) {
-                            val opts = BitmapFactory.Options().apply { inSampleSize = 2 }
-                            BitmapFactory.decodeByteArray(rawJpegBytes, 0, rawJpegBytes.size, opts)
+                        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                        BitmapFactory.decodeByteArray(rawJpegBytes, 0, rawJpegBytes.size, bounds)
+                        var sample = 1
+                        // Proteger memoria RAM en sensores de 48MP/108MP manteniendo ultra alta definición (hasta ~3840px)
+                        while (bounds.outWidth / sample > 3840 || bounds.outHeight / sample > 3840) {
+                            sample *= 2
                         }
+                        val opts = BitmapFactory.Options().apply {
+                            inSampleSize = sample
+                            inPreferredConfig = Bitmap.Config.ARGB_8888
+                        }
+                        val decoded = BitmapFactory.decodeByteArray(rawJpegBytes, 0, rawJpegBytes.size, opts)
                         if (decoded != null) {
-                            // Corregir rotación física del sensor (Frontal 270° + espejo horizontal / Trasera 90°)
                             val m = Matrix()
                             val rotDeg = if (isDeviceLandscape) {
                                 if (uiRotationDeg < 0f) (lens.sensorOrientation + 90) % 360
@@ -880,7 +838,6 @@ fun CinemaCameraScreen() {
                             }
                             m.postRotate(rotDeg.toFloat())
                             if (lens.isFront) {
-                                // Espejo horizontal en selfies para coincidir con el visor sin deformar proporción
                                 m.postScale(-1f, 1f)
                             }
                             highResCleanBitmap = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, m, true)
@@ -928,7 +885,6 @@ fun CinemaCameraScreen() {
                             finalBmp.compress(fmt, 100, out)
                         }
 
-                        // Guardar la metadata EXIF y el respaldo original limpio para re-edición futura
                         val recipe = PhotoEditRecipe(
                             presetId = selectedPreset.id,
                             ev = exposureEvSteps * lens.evStep,
@@ -960,28 +916,19 @@ fun CinemaCameraScreen() {
                 refreshGalleryFromMediaStore()
                 withContext(Dispatchers.Main) {
                     isCapturingPhoto = false
-                    Toast.makeText(context, "Guardada en máxima calidad (${lens.maxResolutionMp})", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Foto guardada en Galería", Toast.LENGTH_SHORT).show()
                 }
-            } catch (e: Exception) {
+            } catch (t: Throwable) {
                 withContext(Dispatchers.Main) {
                     isCapturingPhoto = false
-                    Toast.makeText(context, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Error al capturar: ${t.message}", Toast.LENGTH_SHORT).show()
                 }
             }
         }
     }
 
-    if (showGalleryScreen) {
-        DarkroomGalleryScreen(
-            persistedMedia = persistedMedia,
-            onRefreshGallery = { refreshGalleryFromMediaStore() },
-            onClose = { showGalleryScreen = false }
-        )
-        return
-    }
-
     // ========================================================================
-    // PLANTILLA UNIFICADA FIJA: TODO SE MANTIENE TAL CUAL Y SOLO ROTAN ICONOS
+    // INTERFAZ PRINCIPAL + GALERÍA EN CAPA SUPERPUESTA (SIN DESTRUIR TEXTUREVIEW)
     // ========================================================================
     Box(
         modifier = Modifier
@@ -1011,20 +958,20 @@ fun CinemaCameraScreen() {
                     }
                     .pointerInput(Unit) {
                         detectTapGestures { offset ->
-                            focusNormX = (offset.x / size.width.toFloat()).coerceIn(0.08f, 0.90f)
-                            focusNormY = (offset.y / size.height.toFloat()).coerceIn(0.08f, 0.90f)
-                            showFocusEvBar = true
-                            lastFocusTouchMillis = System.currentTimeMillis()
-                            val cam = cameraDevice
-                            val sess = captureSession
-                            val tex = textureViewRef.value
-                            if (cam != null && sess != null && tex != null) {
-                                applyRepeatingPreviewParameters(cam, sess, tex, offset)
+                            if (size.width > 0 && size.height > 0) {
+                                focusNormX = (offset.x / size.width.toFloat()).coerceIn(0.08f, 0.90f)
+                                focusNormY = (offset.y / size.height.toFloat()).coerceIn(0.08f, 0.90f)
+                                showFocusEvBar = true
+                                lastFocusTouchMillis = System.currentTimeMillis()
+                                val cam = cameraDevice
+                                val sess = captureSession
+                                if (cam != null && sess != null) {
+                                    applyRepeatingPreviewParameters(cam, sess, offset)
+                                }
                             }
                         }
                     }
             ) {
-                // VISOR DE CÁMARA EN TIEMPO REAL
                 AndroidView(
                     factory = { ctx ->
                         TextureView(ctx).apply {
@@ -1044,12 +991,10 @@ fun CinemaCameraScreen() {
                     modifier = Modifier.fillMaxSize()
                 )
 
-                // CAPA EN VIVO DE VFX INTERACTIVOS, DETECCIÓN FACIAL Y RETÍCULA DE ENFOQUE
                 Canvas(modifier = Modifier.fillMaxSize()) {
                     val w = size.width
                     val h = size.height
 
-                    // 1. VFX Ópticos Interactivos en Tiempo Real
                     drawIntoCanvas { composeCanvas ->
                         AnalogImageProcessor.drawInteractiveOpticalVfx(
                             canvas = composeCanvas.nativeCanvas,
@@ -1060,7 +1005,6 @@ fun CinemaCameraScreen() {
                         )
                     }
 
-                    // 2. Marco Polaroid en vivo si está activado
                     if (vfxConfig.polaroidFrame) {
                         val bSide = w * 0.045f
                         val bBot = h * 0.12f
@@ -1070,7 +1014,6 @@ fun CinemaCameraScreen() {
                         drawRect(Color(0xFFF7F5EE), topLeft = Offset(w - bSide, 0f), size = androidx.compose.ui.geometry.Size(bSide, h))
                     }
 
-                    // 3. Guías de Esquinas del Visor
                     val pad = 18.dp.toPx()
                     val arm = 54.dp.toPx()
                     val strokeW = 1.4.dp.toPx()
@@ -1085,7 +1028,6 @@ fun CinemaCameraScreen() {
                     drawLine(bracketCol, Offset(pad, h - pad - arm), Offset(pad, h - pad), strokeW)
                     drawLine(bracketCol, Offset(pad, h - pad), Offset(pad + arm * 1.4f, h - pad), strokeW)
 
-                    // 4. Recuadros de Detección Facial en tiempo real
                     val faceCol = Color(0xFFD4AF37).copy(alpha = 0.85f)
                     for (faceRect in detectedFacesNorm) {
                         val left = faceRect.left * w
@@ -1101,7 +1043,6 @@ fun CinemaCameraScreen() {
                         )
                     }
 
-                    // 5. Retícula de Enfoque [ + ] donde toca el usuario
                     val fx = focusNormX * w
                     val fy = focusNormY * h
                     val boxR = 42.dp.toPx()
@@ -1124,17 +1065,17 @@ fun CinemaCameraScreen() {
                     drawLine(bracketCol, Offset(fx, fy - cross), Offset(fx, fy + cross), strokeW)
                 }
 
-                // ============================================================
-                // MINI BARRA DE EXPOSICIÓN A LA DERECHA DEL ÁREA DE ENFOQUE
-                // ============================================================
+                // Mini barra de exposición a la derecha del cuadro de enfoque
                 if (showFocusEvBar) {
                     val evRange = activeLens.evRange
                     val normEv = ((exposureEvSteps - evRange.lower).toFloat() /
                         (evRange.upper - evRange.lower).coerceAtLeast(1).toFloat()).coerceIn(0f, 1f)
 
                     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-                        val barX = ((focusNormX * maxWidth.value) + 52f).coerceIn(24f, maxWidth.value - 42f).dp
-                        val barY = ((focusNormY * maxHeight.value) - 58f).coerceIn(48f, maxHeight.value - 150f).dp
+                        val maxW = maxWidth.value.coerceAtLeast(100f)
+                        val maxH = maxHeight.value.coerceAtLeast(220f)
+                        val barX = ((focusNormX * maxW) + 52f).coerceIn(24f, (maxW - 42f).coerceAtLeast(24f)).dp
+                        val barY = ((focusNormY * maxH) - 58f).coerceIn(48f, (maxH - 150f).coerceAtLeast(48f)).dp
 
                         Column(
                             horizontalAlignment = Alignment.CenterHorizontally,
@@ -1148,7 +1089,7 @@ fun CinemaCameraScreen() {
                                     detectVerticalDragGestures { change, dragAmount ->
                                         change.consume()
                                         lastFocusTouchMillis = System.currentTimeMillis()
-                                        val delta = (-dragAmount / size.height.toFloat()) * (evRange.upper - evRange.lower)
+                                        val delta = (-dragAmount / size.height.coerceAtLeast(1).toFloat()) * (evRange.upper - evRange.lower)
                                         exposureEvSteps = (exposureEvSteps + delta.roundToInt())
                                             .coerceIn(evRange.lower, evRange.upper)
                                     }
@@ -1187,7 +1128,7 @@ fun CinemaCameraScreen() {
                 }
 
                 // ============================================================
-                // HUD SUPERIOR IZQUIERDO (SIN ICONO DE BATERÍA): AUTO/PRO + 16:9 / 4:3
+                // HUD SUPERIOR IZQUIERDO: AUTO/PRO + 16:9/4:3 + BOTÓN FLASH DIRECTO
                 // ============================================================
                 Row(
                     modifier = Modifier
@@ -1234,6 +1175,49 @@ fun CinemaCameraScreen() {
                         )
                     }
 
+                    // BOTÓN DIRECTO DE FLASH (Activar / Desactivar con un toque)
+                    val isFlashActive = flashMode != FlashMode.OFF
+                    Surface(
+                        color = if (isFlashActive) Color(0xFFD4AF37) else Color.Black.copy(alpha = 0.65f),
+                        shape = RoundedCornerShape(4.dp),
+                        border = BorderStroke(1.dp, if (isFlashActive) Color(0xFFD4AF37) else Color.White.copy(alpha = 0.7f)),
+                        modifier = Modifier
+                            .rotate(animatedIconRotation)
+                            .clickable {
+                                flashMode = when (flashMode) {
+                                    FlashMode.OFF -> FlashMode.ON
+                                    FlashMode.ON -> FlashMode.TORCH
+                                    FlashMode.TORCH -> FlashMode.AUTO
+                                    else -> FlashMode.OFF
+                                }
+                            }
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = if (isFlashActive) Icons.Default.FlashOn else Icons.Default.FlashOff,
+                                contentDescription = "Flash",
+                                tint = if (isFlashActive) Color.Black else Color.White,
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Spacer(Modifier.width(3.dp))
+                            Text(
+                                text = when (flashMode) {
+                                    FlashMode.OFF -> "OFF"
+                                    FlashMode.ON -> "ON"
+                                    FlashMode.TORCH -> "LUZ"
+                                    FlashMode.AUTO -> "AUTO"
+                                    FlashMode.DISPOSABLE -> "RETRO"
+                                },
+                                color = if (isFlashActive) Color.Black else Color.White,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                        }
+                    }
+
                     if (currentZoom > 1.05f) {
                         Surface(
                             color = Color.Black.copy(alpha = 0.65f),
@@ -1252,9 +1236,7 @@ fun CinemaCameraScreen() {
                     }
                 }
 
-                // ============================================================
-                // TIMECODE SUPERIOR CENTRAL Y ● REC (SOLO APARECEN AL GRABAR)
-                // ============================================================
+                // Timecode central y REC solo al grabar video
                 AnimatedVisibility(
                     visible = isRecordingVideo,
                     modifier = Modifier.align(Alignment.TopCenter).padding(top = 24.dp)
@@ -1293,7 +1275,6 @@ fun CinemaCameraScreen() {
                     }
                 }
 
-                // Alerta de Baja Luz
                 AnimatedVisibility(
                     visible = sceneLight.isLowLight && flashMode == FlashMode.OFF && !lowLightPromptDismissed,
                     modifier = Modifier.align(Alignment.TopCenter).padding(top = 58.dp)
@@ -1327,9 +1308,7 @@ fun CinemaCameraScreen() {
                     }
                 }
 
-                // ============================================================
-                // DOCK DE 4 BOTONES: FILMS | VFX | PRO | LENS (SOLO ROTAN ICONOS)
-                // ============================================================
+                // Dock inferior derecho (FILMS | VFX | PRO | LENS)
                 Surface(
                     color = Color(0xAA101216),
                     shape = RoundedCornerShape(14.dp),
@@ -1373,9 +1352,7 @@ fun CinemaCameraScreen() {
                     }
                 }
 
-                // ============================================================
-                // PANELES DESPLEGABLES (FILMS, VFX, PRO, LENS)
-                // ============================================================
+                // Paneles desplegables
                 AnimatedVisibility(
                     visible = activeDockTab != DockTab.NONE,
                     modifier = Modifier
@@ -1580,18 +1557,19 @@ fun CinemaCameraScreen() {
                                         }
 
                                         if (isManualMode) {
-                                            val isoR = activeLens.isoRange
+                                            val isoMin = activeLens.isoRange.lower.toFloat()
+                                            val isoMax = activeLens.isoRange.upper.toFloat().coerceAtLeast(isoMin + 100f)
                                             Text("ISO: $selectedIso", color = Color.LightGray, fontSize = 11.sp)
                                             Slider(
-                                                value = selectedIso.toFloat().coerceIn(isoR.lower.toFloat(), isoR.upper.toFloat()),
+                                                value = selectedIso.toFloat().coerceIn(isoMin, isoMax),
                                                 onValueChange = { selectedIso = it.toInt() },
-                                                valueRange = isoR.lower.toFloat()..isoR.upper.toFloat().coerceAtMost(6400f)
+                                                valueRange = isoMin..isoMax
                                             )
 
                                             val shutterDenom = (1_000_000_000L / selectedShutterNs.coerceAtLeast(1)).coerceAtLeast(1)
                                             Text("Obturación: 1/${shutterDenom}s", color = Color.LightGray, fontSize = 11.sp)
                                             Slider(
-                                                value = selectedShutterNs.toFloat(),
+                                                value = selectedShutterNs.toFloat().coerceIn(200_000f, 100_000_000f),
                                                 onValueChange = { selectedShutterNs = it.toLong() },
                                                 valueRange = 200_000f..100_000_000f
                                             )
@@ -1610,22 +1588,6 @@ fun CinemaCameraScreen() {
                                             onValueChange = { vfxConfig = vfxConfig.copy(tint = it) },
                                             valueRange = -1.0f..1.0f
                                         )
-
-                                        Row(
-                                            modifier = Modifier.fillMaxWidth(),
-                                            horizontalArrangement = Arrangement.SpaceBetween,
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Text("Flash: ${flashMode.label}", color = Color(0xFFD4AF37), fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                            TextButton(
-                                                onClick = {
-                                                    val modes = FlashMode.values()
-                                                    flashMode = modes[(flashMode.ordinal + 1) % modes.size]
-                                                }
-                                            ) {
-                                                Text("CAMBIAR MODO FLASH", color = Color.White, fontSize = 11.sp)
-                                            }
-                                        }
 
                                         Text("Intensidad del Flash: ${(flashStrengthPercent * 100).toInt()}%", color = Color.LightGray, fontSize = 11.sp)
                                         Slider(
@@ -1683,9 +1645,7 @@ fun CinemaCameraScreen() {
             }
         }
 
-        // ====================================================================
-        // BARRA DE DISPARO FIJA (SE MANTIENE TAL CUAL Y SOLO ROTAN LOS ICONOS)
-        // ====================================================================
+        // BARRA DE DISPARO INFERIOR FIJA
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -1699,7 +1659,10 @@ fun CinemaCameraScreen() {
             GalleryThumbnailButton(
                 bitmap = latestThumbnailBmp,
                 rotationDeg = animatedIconRotation,
-                onClick = { showGalleryScreen = true }
+                onClick = {
+                    refreshGalleryFromMediaStore()
+                    showGalleryScreen = true
+                }
             )
 
             Row(
@@ -1728,6 +1691,17 @@ fun CinemaCameraScreen() {
                 }
             )
         }
+
+        // GALERÍA SUPERPUESTA (NO DESMONTA EL TEXTUREVIEW NI CIERRA LA SESIÓN DE CÁMARA)
+        if (showGalleryScreen) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                DarkroomGalleryScreen(
+                    persistedMedia = persistedMedia,
+                    onRefreshGallery = { refreshGalleryFromMediaStore() },
+                    onClose = { showGalleryScreen = false }
+                )
+            }
+        }
     }
 
     if (showHardwareModal) {
@@ -1747,13 +1721,8 @@ fun CinemaCameraScreen() {
                     Text("• Lente Activo: ${activeLens.label} (ID ${activeLens.cameraId})", color = Color.White, fontSize = 12.sp)
                     Text("• Nivel Hardware ISP: ${activeLens.hardwareLevel}", color = Color.White, fontSize = 12.sp)
                     Text("• Resolución Fotográfica Nativa: ${activeLens.maxResolutionMp}", color = Color.White, fontSize = 12.sp)
-                    Text("• Resolución de Video Nativa: ${activeLens.maxVideoSize.width}x${activeLens.maxVideoSize.height}", color = Color.White, fontSize = 12.sp)
+                    Text("• Resolución de Video Activa: ${activeLens.maxVideoSize.width}x${activeLens.maxVideoSize.height}", color = Color.White, fontSize = 12.sp)
                     Text("• Tamaño Físico del Sensor: ${activeLens.physicalSizeMm}", color = Color.White, fontSize = 12.sp)
-                    Text(
-                        "• Adaptación de Color: ${if (activeLens.isFront) "Modo Frontal Suave (Protección de Piel y Bits)" else "Modo Sensor Principal Completo"}",
-                        color = Color(0xFF81C784),
-                        fontSize = 12.sp
-                    )
                 }
             },
             confirmButton = {
@@ -1891,7 +1860,7 @@ fun GalleryThumbnailButton(
             .clickable(onClick = onClick),
         contentAlignment = Alignment.Center
     ) {
-        if (bitmap != null) {
+        if (bitmap != null && !bitmap.isRecycled) {
             Image(
                 bitmap = bitmap.asImageBitmap(),
                 contentDescription = "Última foto en galería",
