@@ -4,11 +4,14 @@ import android.content.ContentValues
 import android.graphics.Bitmap
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.RenderEffect
+import android.graphics.SurfaceTexture
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import android.view.Surface
+import android.view.TextureView
 import android.widget.Toast
-import android.widget.VideoView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.*
@@ -22,7 +25,6 @@ import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -37,7 +39,6 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -57,26 +58,24 @@ fun DarkroomGalleryScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    // 1. Organización automática: TODOS | FOTOS | VIDEOS
+    // 1. Filtro automático entre TODOS, FOTOS y VIDEOS
     var mediaFilter by remember { mutableStateOf(GalleryMediaFilter.ALL) }
-    val filteredMedia = remember(persistedMedia, mediaFilter) {
+    val allItemsSnapshot = persistedMedia.toList()
+    val filteredMedia = remember(allItemsSnapshot, mediaFilter) {
         when (mediaFilter) {
-            GalleryMediaFilter.ALL -> persistedMedia
-            GalleryMediaFilter.PHOTOS -> persistedMedia.filter { !it.isVideo }
-            GalleryMediaFilter.VIDEOS -> persistedMedia.filter { it.isVideo }
+            GalleryMediaFilter.ALL -> allItemsSnapshot
+            GalleryMediaFilter.PHOTOS -> allItemsSnapshot.filter { !it.isVideo }
+            GalleryMediaFilter.VIDEOS -> allItemsSnapshot.filter { it.isVideo }
         }
     }
 
-    // 2. Selección múltiple para Borrar / Compartir / Crear Collage
     var isSelectionMode by remember { mutableStateOf(false) }
     val selectedUris = remember { mutableStateListOf<Uri>() }
 
-    // 3. Visor deslizable izquierda/derecha (HorizontalPager) y Modo Editor
     var activePagerIndex by remember { mutableStateOf<Int?>(null) }
     var isEditingMode by remember { mutableStateOf(false) }
     var showCollageCreator by remember { mutableStateOf(false) }
 
-    // Estado del Editor (restaurado desde la metadata EXIF cuando se abre una foto)
     var editingBaseBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var editingDisplayName by remember { mutableStateOf<String?>(null) }
     var editingTargetUri by remember { mutableStateOf<Uri?>(null) }
@@ -89,13 +88,12 @@ fun DarkroomGalleryScreen(
     var editAspect by remember { mutableStateOf(AspectRatioMode.RATIO_16_9) }
     var customSunX by remember { mutableStateOf(0.75f) }
     var customSunY by remember { mutableStateOf(0.25f) }
-    var editorSubTab by remember { mutableStateOf(0) } // 0=Films, 1=Temp/Tinte/EV, 2=VFX
+    var editorSubTab by remember { mutableStateOf(0) }
 
-    // Importar foto externa de la galería del teléfono para editarla
     val externalPhotoPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         if (uri != null) {
             scope.launch(Dispatchers.IO) {
-                val bmp = MediaStoreRepository.loadFullBitmap(context, uri, 2560)
+                val bmp = MediaStoreRepository.loadFullBitmap(context, uri, 1920)
                 val recipe = MediaStoreRepository.loadRecipeFromUri(context, uri)
                 withContext(Dispatchers.Main) {
                     if (bmp != null) {
@@ -122,6 +120,8 @@ fun DarkroomGalleryScreen(
                             editVfx = VfxConfig()
                         }
                         isEditingMode = true
+                    } else {
+                        Toast.makeText(context, "No se pudo abrir la imagen seleccionada", Toast.LENGTH_SHORT).show()
                     }
                 }
             }
@@ -139,48 +139,50 @@ fun DarkroomGalleryScreen(
         }
     }
 
-    // Recalcular vista previa del Editor en tiempo real
+    // Vista previa del Editor en tiempo real sin reciclar el bitmap original
     LaunchedEffect(
         editingBaseBitmap, isEditingMode, activePreset, activeLut,
         editVfx, editEv, editAspect, customSunX, customSunY
     ) {
         val src = editingBaseBitmap ?: return@LaunchedEffect
-        if (!isEditingMode) return@LaunchedEffect
+        if (!isEditingMode || src.isRecycled) return@LaunchedEffect
         withContext(Dispatchers.Default) {
-            val scale = 960f / maxOf(src.width, src.height).coerceAtLeast(1)
-            val sw = (src.width * scale).toInt().coerceAtLeast(120)
-            val sh = (src.height * scale).toInt().coerceAtLeast(120)
-            val scaled = Bitmap.createScaledBitmap(src, sw, sh, true)
+            try {
+                val scale = 900f / maxOf(src.width, src.height).coerceAtLeast(1)
+                val sw = (src.width * scale).toInt().coerceAtLeast(120)
+                val sh = (src.height * scale).toInt().coerceAtLeast(120)
+                // Crear siempre una copia independiente para no reciclar nunca editingBaseBitmap
+                val scaledCopy = Bitmap.createScaledBitmap(src, sw, sh, true).copy(Bitmap.Config.ARGB_8888, true)
 
-            val smallAnalyze = Bitmap.createScaledBitmap(scaled, 64, 64, true)
-            val baseAnalysis = AnalogImageProcessor.analyzeSceneLight(smallAnalyze).copy(
-                sunX = customSunX,
-                sunY = customSunY
-            )
-            smallAnalyze.recycle()
+                val smallAnalyze = Bitmap.createScaledBitmap(scaledCopy, 64, 64, true)
+                val baseAnalysis = AnalogImageProcessor.analyzeSceneLight(smallAnalyze).copy(
+                    sunX = customSunX,
+                    sunY = customSunY
+                )
+                if (smallAnalyze !== scaledCopy) smallAnalyze.recycle()
 
-            val result = AnalogImageProcessor.processImage(
-                source = scaled,
-                aspectMode = editAspect,
-                preset = activePreset,
-                customLut = activeLut,
-                vfx = editVfx,
-                light = baseAnalysis,
-                exposureBias = editEv,
-                disposableFlashActive = false,
-                isFrontSensor = false,
-                metadataStamp = "${activePreset.brand} ${activePreset.name}  •  DARKROOM"
-            )
-            withContext(Dispatchers.Main) {
-                previewBitmap = result
-            }
+                val result = AnalogImageProcessor.processImage(
+                    source = scaledCopy,
+                    aspectMode = editAspect,
+                    preset = activePreset,
+                    customLut = activeLut,
+                    vfx = editVfx,
+                    light = baseAnalysis,
+                    exposureBias = editEv,
+                    disposableFlashActive = false,
+                    isFrontSensor = false,
+                    metadataStamp = "${activePreset.brand} ${activePreset.name}  •  DARKROOM"
+                )
+                withContext(Dispatchers.Main) {
+                    previewBitmap = result
+                }
+            } catch (_: Throwable) {}
         }
     }
 
-    // Si está abierto el Creador de Collages (8mm, 35mm, 75mm, 21:9, Película)
     if (showCollageCreator) {
         CollageStudioModal(
-            appPhotos = persistedMedia.filter { !it.isVideo },
+            appPhotos = allItemsSnapshot.filter { !it.isVideo },
             preselectedUris = selectedUris.toList(),
             onSaved = {
                 onRefreshGallery()
@@ -195,6 +197,7 @@ fun DarkroomGalleryScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFF0A0B0E))
+            .clickable(enabled = true, onClick = {}) // Intercepta toques para no pasar al visor de fondo
             .padding(12.dp)
     ) {
         // BARRA SUPERIOR DE GALERÍA
@@ -254,7 +257,7 @@ fun DarkroomGalleryScreen(
         }
 
         // ====================================================================
-        // MODO 1: EDITOR NO DESTRUCTIVO CON METADATA EXIF + TEMPERATURA Y TINTE
+        // MODO 1: EDITOR NO DESTRUCTIVO CON TEMPERATURA, TINTE Y METADATA
         // ====================================================================
         if (isEditingMode && editingBaseBitmap != null) {
             Box(
@@ -266,30 +269,25 @@ fun DarkroomGalleryScreen(
                     .background(Color.Black)
                     .pointerInput(Unit) {
                         detectTapGestures { pos ->
-                            customSunX = (pos.x / size.width.toFloat()).coerceIn(0.02f, 0.98f)
-                            customSunY = (pos.y / size.height.toFloat()).coerceIn(0.02f, 0.98f)
+                            if (size.width > 0 && size.height > 0) {
+                                customSunX = (pos.x / size.width.toFloat()).coerceIn(0.02f, 0.98f)
+                                customSunY = (pos.y / size.height.toFloat()).coerceIn(0.02f, 0.98f)
+                            }
                         }
                     },
                 contentAlignment = Alignment.Center
             ) {
-                previewBitmap?.let { bmp ->
+                val bmpToDraw = previewBitmap
+                if (bmpToDraw != null && !bmpToDraw.isRecycled) {
                     Image(
-                        bitmap = bmp.asImageBitmap(),
-                        contentDescription = "Previsualización de edición",
+                        bitmap = bmpToDraw.asImageBitmap(),
+                        contentDescription = "Previsualización",
                         contentScale = ContentScale.Fit,
                         modifier = Modifier.fillMaxSize()
                     )
+                } else {
+                    CircularProgressIndicator(color = Color(0xFFD4AF37))
                 }
-                Text(
-                    text = "Metadata cargada • Toca la imagen para orientar el Sol / Flare",
-                    color = Color.White.copy(alpha = 0.8f),
-                    fontSize = 10.sp,
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .padding(8.dp)
-                        .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
-                        .padding(horizontal = 6.dp, vertical = 2.dp)
-                )
             }
 
             Column(
@@ -335,6 +333,7 @@ fun DarkroomGalleryScreen(
                                         .background(if (isSel) Color(0xFFD4AF37) else Color(0xFF22252A))
                                         .clickable {
                                             activePreset = preset
+                                            if (preset.isNoLut) activeLut = null
                                             editVfx = editVfx.copy(
                                                 grainIntensity = preset.defaultGrain,
                                                 noiseIntensity = preset.defaultNoise
@@ -381,13 +380,6 @@ fun DarkroomGalleryScreen(
                                     onClick = { lutPicker.launch("*/*") },
                                     label = { Text("+ .CUBE", fontSize = 10.sp) }
                                 )
-                            }
-                            if (activeLut != null) {
-                                item {
-                                    TextButton(onClick = { activeLut = null }) {
-                                        Text("Sin LUT", color = Color(0xFFE53935), fontSize = 10.sp)
-                                    }
-                                }
                             }
                         }
                     }
@@ -470,72 +462,78 @@ fun DarkroomGalleryScreen(
                         onClick = {
                             val orig = editingBaseBitmap ?: return@Button
                             scope.launch(Dispatchers.IO) {
-                                val small = Bitmap.createScaledBitmap(orig, 64, 64, true)
-                                val baseLight = AnalogImageProcessor.analyzeSceneLight(small).copy(
-                                    sunX = customSunX,
-                                    sunY = customSunY
-                                )
-                                small.recycle()
+                                try {
+                                    val origCopy = orig.copy(Bitmap.Config.ARGB_8888, true)
+                                    val small = Bitmap.createScaledBitmap(origCopy, 64, 64, true)
+                                    val baseLight = AnalogImageProcessor.analyzeSceneLight(small).copy(
+                                        sunX = customSunX,
+                                        sunY = customSunY
+                                    )
+                                    if (small !== origCopy) small.recycle()
 
-                                val finalBmp = AnalogImageProcessor.processImage(
-                                    source = orig,
-                                    aspectMode = editAspect,
-                                    preset = activePreset,
-                                    customLut = activeLut,
-                                    vfx = editVfx,
-                                    light = baseLight,
-                                    exposureBias = editEv,
-                                    disposableFlashActive = false,
-                                    isFrontSensor = false,
-                                    metadataStamp = "${activePreset.brand} ${activePreset.name}  •  DARKROOM"
-                                )
+                                    val finalBmp = AnalogImageProcessor.processImage(
+                                        source = origCopy,
+                                        aspectMode = editAspect,
+                                        preset = activePreset,
+                                        customLut = activeLut,
+                                        vfx = editVfx,
+                                        light = baseLight,
+                                        exposureBias = editEv,
+                                        disposableFlashActive = false,
+                                        isFrontSensor = false,
+                                        metadataStamp = "${activePreset.brand} ${activePreset.name}  •  DARKROOM"
+                                    )
 
-                                val recipe = PhotoEditRecipe(
-                                    presetId = activePreset.id,
-                                    ev = editEv,
-                                    temperature = editVfx.temperature,
-                                    tint = editVfx.tint,
-                                    grain = editVfx.grainIntensity,
-                                    noise = editVfx.noiseIntensity,
-                                    flare = editVfx.sunFlareIntensity,
-                                    leak = editVfx.lightLeakIntensity,
-                                    anamorphic = editVfx.anamorphicIntensity,
-                                    halation = editVfx.halationIntensity,
-                                    polaroid = editVfx.polaroidFrame,
-                                    aspectName = editAspect.name
-                                )
+                                    val recipe = PhotoEditRecipe(
+                                        presetId = activePreset.id,
+                                        ev = editEv,
+                                        temperature = editVfx.temperature,
+                                        tint = editVfx.tint,
+                                        grain = editVfx.grainIntensity,
+                                        noise = editVfx.noiseIntensity,
+                                        flare = editVfx.sunFlareIntensity,
+                                        leak = editVfx.lightLeakIntensity,
+                                        anamorphic = editVfx.anamorphicIntensity,
+                                        halation = editVfx.halationIntensity,
+                                        polaroid = editVfx.polaroidFrame,
+                                        aspectName = editAspect.name
+                                    )
 
-                                // Si estamos re-editando una foto de la app, actualizamos su archivo y su metadata EXIF
-                                val existingUri = editingTargetUri
-                                val dispName = editingDisplayName ?: "ANALOG_${System.currentTimeMillis()}.jpg"
-                                if (existingUri != null) {
-                                    context.contentResolver.openOutputStream(existingUri, "wt")?.use { out ->
-                                        finalBmp.compress(Bitmap.CompressFormat.JPEG, 100, out)
-                                    }
-                                    MediaStoreRepository.saveOriginalBackupAndExifRecipe(context, existingUri, dispName, orig, recipe)
-                                } else {
-                                    val values = ContentValues().apply {
-                                        put(MediaStore.Images.Media.DISPLAY_NAME, dispName)
-                                        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                                            put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/AnalogPro")
-                                        }
-                                    }
-                                    val newUri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                                    if (newUri != null) {
-                                        context.contentResolver.openOutputStream(newUri)?.use { out ->
+                                    val existingUri = editingTargetUri
+                                    val dispName = editingDisplayName ?: "ANALOG_${System.currentTimeMillis()}.jpg"
+                                    if (existingUri != null) {
+                                        context.contentResolver.openOutputStream(existingUri, "wt")?.use { out ->
                                             finalBmp.compress(Bitmap.CompressFormat.JPEG, 100, out)
                                         }
-                                        MediaStoreRepository.saveOriginalBackupAndExifRecipe(context, newUri, dispName, orig, recipe)
+                                        MediaStoreRepository.saveOriginalBackupAndExifRecipe(context, existingUri, dispName, orig, recipe)
+                                    } else {
+                                        val values = ContentValues().apply {
+                                            put(MediaStore.Images.Media.DISPLAY_NAME, dispName)
+                                            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                                put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/AnalogPro")
+                                            }
+                                        }
+                                        val newUri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                                        if (newUri != null) {
+                                            context.contentResolver.openOutputStream(newUri)?.use { out ->
+                                                finalBmp.compress(Bitmap.CompressFormat.JPEG, 100, out)
+                                            }
+                                            MediaStoreRepository.saveOriginalBackupAndExifRecipe(context, newUri, dispName, orig, recipe)
+                                        }
                                     }
-                                }
 
-                                finalBmp.recycle()
-                                withContext(Dispatchers.Main) {
-                                    onRefreshGallery()
-                                    Toast.makeText(context, "Guardada con Metadata EXIF re-editable", Toast.LENGTH_SHORT).show()
-                                    isEditingMode = false
-                                    editingBaseBitmap = null
+                                    finalBmp.recycle()
+                                    withContext(Dispatchers.Main) {
+                                        onRefreshGallery()
+                                        Toast.makeText(context, "Guardada con Metadata EXIF", Toast.LENGTH_SHORT).show()
+                                        isEditingMode = false
+                                        editingBaseBitmap = null
+                                    }
+                                } catch (t: Throwable) {
+                                    withContext(Dispatchers.Main) {
+                                        Toast.makeText(context, "Error guardando: ${t.message}", Toast.LENGTH_SHORT).show()
+                                    }
                                 }
                             }
                         },
@@ -552,15 +550,20 @@ fun DarkroomGalleryScreen(
         // MODO 2: VISOR DE PANTALLA COMPLETA DESLIZABLE IZQUIERDA/DERECHA
         // ====================================================================
         if (activePagerIndex != null && filteredMedia.isNotEmpty()) {
-            val initialPage = activePagerIndex!!.coerceIn(0, filteredMedia.lastIndex)
-            val pagerState = rememberPagerState(initialPage = initialPage) { filteredMedia.size }
-            val currentItem = filteredMedia[pagerState.currentPage.coerceIn(0, filteredMedia.lastIndex)]
+            val safeInitial = activePagerIndex!!.coerceIn(0, (filteredMedia.size - 1).coerceAtLeast(0))
+            val pagerState = rememberPagerState(
+                initialPage = safeInitial,
+                pageCount = { filteredMedia.size }
+            )
+            val safeCurrentIdx = pagerState.currentPage.coerceIn(0, (filteredMedia.size - 1).coerceAtLeast(0))
+            val currentItem = filteredMedia[safeCurrentIdx]
             var videoPreviewPreset by remember { mutableStateOf(BUILT_IN_PRESETS[0]) }
 
             HorizontalPager(
                 state = pagerState,
                 modifier = Modifier.fillMaxWidth().weight(1f).padding(vertical = 6.dp)
             ) { page ->
+                if (page !in filteredMedia.indices) return@HorizontalPager
                 val item = filteredMedia[page]
                 var zoomScale by remember(page) { mutableStateOf(1f) }
                 var offsetX by remember(page) { mutableStateOf(0f) }
@@ -570,7 +573,7 @@ fun DarkroomGalleryScreen(
                 LaunchedEffect(item.uri) {
                     if (!item.isVideo) {
                         withContext(Dispatchers.IO) {
-                            val b = MediaStoreRepository.loadFullBitmap(context, item.uri, 2048)
+                            val b = MediaStoreRepository.loadFullBitmap(context, item.uri, 1920)
                             withContext(Dispatchers.Main) { fullBmp = b }
                         }
                     }
@@ -596,24 +599,10 @@ fun DarkroomGalleryScreen(
                     contentAlignment = Alignment.Center
                 ) {
                     if (item.isVideo) {
-                        AndroidView(
-                            factory = { ctx ->
-                                VideoView(ctx).apply {
-                                    setVideoURI(item.uri)
-                                    setOnPreparedListener { mp ->
-                                        mp.isLooping = true
-                                        start()
-                                    }
-                                }
-                            },
-                            update = { view ->
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                                    val cm = AnalogImageProcessor.buildSensorAdaptedMatrix(videoPreviewPreset, false)
-                                    view.setRenderEffect(
-                                        RenderEffect.createColorFilterEffect(ColorMatrixColorFilter(cm))
-                                    )
-                                }
-                            },
+                        // Reproductor seguro de Video sobre TextureView compatible con LUTs y Zoom
+                        SafeTextureVideoPlayer(
+                            videoUri = item.uri,
+                            preset = videoPreviewPreset,
                             modifier = Modifier
                                 .fillMaxSize()
                                 .graphicsLayer(
@@ -623,7 +612,7 @@ fun DarkroomGalleryScreen(
                                     translationY = offsetY
                                 )
                         )
-                    } else if (fullBmp != null) {
+                    } else if (fullBmp != null && !fullBmp!!.isRecycled) {
                         Image(
                             bitmap = fullBmp!!.asImageBitmap(),
                             contentDescription = item.displayName,
@@ -654,7 +643,6 @@ fun DarkroomGalleryScreen(
                 }
             }
 
-            // Si es un video, permitir probar filtros en tiempo real sobre el reproductor
             if (currentItem.isVideo) {
                 LazyRow(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -670,7 +658,6 @@ fun DarkroomGalleryScreen(
                 }
             }
 
-            // Barra de acciones: Compartir, Editar (lee metadata guardada), Borrar
             Row(
                 modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
                 horizontalArrangement = Arrangement.SpaceEvenly,
@@ -688,7 +675,7 @@ fun DarkroomGalleryScreen(
                     Button(
                         onClick = {
                             scope.launch(Dispatchers.IO) {
-                                val cleanBmp = MediaStoreRepository.loadCleanOriginalOrFullBitmap(context, currentItem, 2560)
+                                val cleanBmp = MediaStoreRepository.loadCleanOriginalOrFullBitmap(context, currentItem, 1920)
                                 val savedRecipe = MediaStoreRepository.loadRecipeFromUri(context, currentItem.uri)
                                 withContext(Dispatchers.Main) {
                                     if (cleanBmp != null) {
@@ -729,9 +716,9 @@ fun DarkroomGalleryScreen(
                         scope.launch(Dispatchers.IO) {
                             MediaStoreRepository.deleteMediaItems(context, listOf(currentItem))
                             withContext(Dispatchers.Main) {
+                                activePagerIndex = null
                                 onRefreshGallery()
                                 Toast.makeText(context, "Archivo eliminado", Toast.LENGTH_SHORT).show()
-                                if (filteredMedia.size <= 1) activePagerIndex = null
                             }
                         }
                     },
@@ -746,25 +733,26 @@ fun DarkroomGalleryScreen(
         }
 
         // ====================================================================
-        // MODO 3: CUADRÍCULA CON ORGANIZADOR FOTOS/VIDEOS Y SELECCIÓN MÚLTIPLE
+        // MODO 3: CUADRÍCULA CON PESTAÑAS TODOS / FOTOS / VIDEOS
         // ====================================================================
         Row(
             modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Botones para organizar automáticamente entre TODOS, FOTOS y VIDEOS
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 GalleryMediaFilter.values().forEach { filter ->
                     FilterChip(
                         selected = mediaFilter == filter,
-                        onClick = { mediaFilter = filter },
+                        onClick = {
+                            activePagerIndex = null
+                            mediaFilter = filter
+                        },
                         label = { Text(filter.label, fontSize = 11.sp) }
                     )
                 }
             }
 
-            // Botón para activar Selección Múltiple (Borrar / Compartir varios)
             TextButton(
                 onClick = {
                     isSelectionMode = !isSelectionMode
@@ -780,7 +768,6 @@ fun DarkroomGalleryScreen(
             }
         }
 
-        // Barra flotante cuando hay imágenes seleccionadas para Borrar o Compartir
         if (isSelectionMode && selectedUris.isNotEmpty()) {
             Row(
                 modifier = Modifier
@@ -794,7 +781,7 @@ fun DarkroomGalleryScreen(
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = {
-                            val items = persistedMedia.filter { selectedUris.contains(it.uri) }
+                            val items = allItemsSnapshot.filter { selectedUris.contains(it.uri) }
                             MediaStoreRepository.shareMediaItems(context, items)
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2B303C))
@@ -805,7 +792,7 @@ fun DarkroomGalleryScreen(
                     }
                     Button(
                         onClick = {
-                            val items = persistedMedia.filter { selectedUris.contains(it.uri) }
+                            val items = allItemsSnapshot.filter { selectedUris.contains(it.uri) }
                             scope.launch(Dispatchers.IO) {
                                 val count = MediaStoreRepository.deleteMediaItems(context, items)
                                 withContext(Dispatchers.Main) {
@@ -829,7 +816,7 @@ fun DarkroomGalleryScreen(
 
         if (filteredMedia.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No hay elementos en ${mediaFilter.label}", color = Color.Gray, fontSize = 14.sp)
+                Text("No hay archivos en ${mediaFilter.label}", color = Color.Gray, fontSize = 14.sp)
             }
         } else {
             LazyVerticalGrid(
@@ -838,48 +825,56 @@ fun DarkroomGalleryScreen(
                 verticalArrangement = Arrangement.spacedBy(6.dp),
                 modifier = Modifier.fillMaxSize()
             ) {
-                itemsIndexed(filteredMedia, key = { _, it -> it.uri.toString() }) { index, item ->
+                itemsIndexed(
+                    items = filteredMedia,
+                    key = { idx, item -> "${item.isVideo}_${item.uri}_$idx" }
+                ) { index, item ->
                     var thumb by remember(item.uri) { mutableStateOf<Bitmap?>(null) }
                     val isSelected = selectedUris.contains(item.uri)
 
                     LaunchedEffect(item.uri) {
                         withContext(Dispatchers.IO) {
-                            val loaded = MediaStoreRepository.loadThumbnailBitmap(context, item, 280)
+                            val loaded = MediaStoreRepository.loadThumbnailBitmap(context, item, 240)
                             withContext(Dispatchers.Main) { thumb = loaded }
                         }
                     }
 
-                    Box(
-                        modifier = Modifier
-                            .aspectRatio(1f)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Color(0xFF16181E))
-                            .border(
-                                width = if (isSelected) 3.dp else 0.dp,
-                                color = if (isSelected) Color(0xFFD4AF37) else Color.Transparent,
-                                shape = RoundedCornerShape(8.dp)
-                            )
-                            .combinedClickable(
-                                onClick = {
-                                    if (isSelectionMode) {
-                                        if (isSelected) selectedUris.remove(item.uri) else selectedUris.add(item.uri)
-                                    } else {
-                                        activePagerIndex = index
-                                    }
-                                },
-                                onLongClick = {
-                                    isSelectionMode = true
-                                    if (!isSelected) selectedUris.add(item.uri)
+                    val tileModifier = Modifier
+                        .aspectRatio(1f)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Color(0xFF16181E))
+                        .let { mod ->
+                            if (isSelected) mod.border(3.dp, Color(0xFFD4AF37), RoundedCornerShape(8.dp))
+                            else mod
+                        }
+                        .combinedClickable(
+                            onClick = {
+                                if (isSelectionMode) {
+                                    if (isSelected) selectedUris.remove(item.uri) else selectedUris.add(item.uri)
+                                } else {
+                                    activePagerIndex = index
                                 }
-                            ),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        if (thumb != null) {
+                            },
+                            onLongClick = {
+                                isSelectionMode = true
+                                if (!isSelected) selectedUris.add(item.uri)
+                            }
+                        )
+
+                    Box(modifier = tileModifier, contentAlignment = Alignment.Center) {
+                        val safeThumb = thumb
+                        if (safeThumb != null && !safeThumb.isRecycled) {
                             Image(
-                                bitmap = thumb!!.asImageBitmap(),
+                                bitmap = safeThumb.asImageBitmap(),
                                 contentDescription = item.displayName,
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier.fillMaxSize()
+                            )
+                        } else {
+                            Icon(
+                                imageVector = if (item.isVideo) Icons.Default.Videocam else Icons.Default.Photo,
+                                contentDescription = null,
+                                tint = Color.DarkGray
                             )
                         }
                         if (item.isVideo) {
@@ -887,7 +882,7 @@ fun DarkroomGalleryScreen(
                                 modifier = Modifier
                                     .align(Alignment.BottomEnd)
                                     .padding(6.dp)
-                                    .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(4.dp))
+                                    .background(Color.Black.copy(alpha = 0.75f), RoundedCornerShape(4.dp))
                                     .padding(horizontal = 5.dp, vertical = 2.dp)
                             ) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -911,9 +906,73 @@ fun DarkroomGalleryScreen(
     }
 }
 
-// ============================================================================
-// ESTUDIO DE COLLAGE CINEMATOGRÁFICO (8MM, 35MM, 75MM, 21:9, ESCENA DE PELÍCULA)
-// ============================================================================
+/**
+ * Reproductor de Video seguro basado en TextureView + MediaPlayer (evita el crash de SurfaceView/VideoView).
+ */
+@Composable
+fun SafeTextureVideoPlayer(
+    videoUri: Uri,
+    preset: FilmPreset,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    var mediaPlayer by remember { mutableStateOf<MediaPlayer?>(null) }
+
+    DisposableEffect(videoUri) {
+        onDispose {
+            try {
+                mediaPlayer?.stop()
+            } catch (_: Throwable) {}
+            try {
+                mediaPlayer?.release()
+            } catch (_: Throwable) {}
+            mediaPlayer = null
+        }
+    }
+
+    AndroidView(
+        factory = { ctx ->
+            TextureView(ctx).apply {
+                surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                    override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
+                        try {
+                            val mp = MediaPlayer()
+                            mediaPlayer = mp
+                            mp.setDataSource(context, videoUri)
+                            mp.setSurface(Surface(st))
+                            mp.isLooping = true
+                            mp.setOnErrorListener { _, _, _ -> true }
+                            mp.setOnPreparedListener { player ->
+                                try { player.start() } catch (_: Throwable) {}
+                            }
+                            mp.prepareAsync()
+                        } catch (_: Throwable) {}
+                    }
+                    override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
+                    override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                        try { mediaPlayer?.release() } catch (_: Throwable) {}
+                        mediaPlayer = null
+                        return true
+                    }
+                    override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+                }
+            }
+        },
+        update = { texView ->
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                if (preset.isNoLut) {
+                    texView.setRenderEffect(null)
+                } else {
+                    val cm = AnalogImageProcessor.buildSensorAdaptedMatrix(preset, false)
+                    texView.setRenderEffect(
+                        RenderEffect.createColorFilterEffect(ColorMatrixColorFilter(cm))
+                    )
+                }
+            }
+        },
+        modifier = modifier
+    )
+}
 
 @Composable
 fun CollageStudioModal(
@@ -928,41 +987,44 @@ fun CollageStudioModal(
     val chosenUris = remember { mutableStateListOf<Uri>().apply { addAll(preselectedUris.take(4)) } }
     var selectedTemplate by remember { mutableStateOf(CollageTemplate.FILM_35MM) }
     var selectedPreset by remember { mutableStateOf(BUILT_IN_PRESETS[1]) }
-    var collageTemp by remember { mutableStateOf(0f) }
-    var collageTint by remember { mutableStateOf(0f) }
     var collagePreview by remember { mutableStateOf<Bitmap?>(null) }
 
-    // Selector para agregar múltiples fotos desde la galería del teléfono
     val phoneGalleryPicker = rememberLauncherForActivityResult(
         ActivityResultContracts.GetMultipleContents()
     ) { uris ->
         uris.forEach { u ->
-            if (chosenUris.size < 6 && !chosenUris.contains(u)) chosenUris.add(u)
+            if (chosenUris.size < 5 && !chosenUris.contains(u)) chosenUris.add(u)
         }
     }
 
-    LaunchedEffect(chosenUris.toList(), selectedTemplate, selectedPreset, collageTemp, collageTint) {
+    LaunchedEffect(chosenUris.toList(), selectedTemplate, selectedPreset) {
         if (chosenUris.isEmpty()) {
             collagePreview = null
             return@LaunchedEffect
         }
         withContext(Dispatchers.IO) {
-            val bitmaps = chosenUris.mapNotNull { MediaStoreRepository.loadFullBitmap(context, it, 1024) }
-            if (bitmaps.isNotEmpty()) {
-                val generated = AnalogImageProcessor.generateCinemaCollage(
-                    bitmaps = bitmaps,
-                    template = selectedTemplate,
-                    preset = selectedPreset,
-                    temperature = collageTemp,
-                    tint = collageTint
-                )
-                withContext(Dispatchers.Main) { collagePreview = generated }
-            }
+            try {
+                val bitmaps = chosenUris.mapNotNull { MediaStoreRepository.loadFullBitmap(context, it, 960) }
+                if (bitmaps.isNotEmpty()) {
+                    val generated = AnalogImageProcessor.generateCinemaCollage(
+                        bitmaps = bitmaps,
+                        template = selectedTemplate,
+                        preset = selectedPreset,
+                        temperature = 0f,
+                        tint = 0f
+                    )
+                    withContext(Dispatchers.Main) { collagePreview = generated }
+                }
+            } catch (_: Throwable) {}
         }
     }
 
     Column(
-        modifier = Modifier.fillMaxSize().background(Color(0xFF0A0B0E)).padding(12.dp)
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF0A0B0E))
+            .clickable(enabled = true, onClick = {})
+            .padding(12.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -983,8 +1045,7 @@ fun CollageStudioModal(
             }
         }
 
-        // Tira para elegir fotos de la Galería de la App
-        Text("Toca fotos de la app o del teléfono (2 a 5 fotos):", color = Color.Gray, fontSize = 11.sp)
+        Text("Toca fotos de la app o del teléfono (1 a 5 fotos):", color = Color.Gray, fontSize = 11.sp)
         LazyRow(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             modifier = Modifier.padding(vertical = 6.dp).height(64.dp)
@@ -994,7 +1055,7 @@ fun CollageStudioModal(
                 val isAdded = chosenUris.contains(item.uri)
                 LaunchedEffect(item.uri) {
                     withContext(Dispatchers.IO) {
-                        val b = MediaStoreRepository.loadThumbnailBitmap(context, item, 160)
+                        val b = MediaStoreRepository.loadThumbnailBitmap(context, item, 150)
                         withContext(Dispatchers.Main) { thumb = b }
                     }
                 }
@@ -1005,17 +1066,17 @@ fun CollageStudioModal(
                         .border(2.dp, if (isAdded) Color(0xFFD4AF37) else Color.Transparent, RoundedCornerShape(6.dp))
                         .clickable {
                             if (isAdded) chosenUris.remove(item.uri)
-                            else if (chosenUris.size < 6) chosenUris.add(item.uri)
+                            else if (chosenUris.size < 5) chosenUris.add(item.uri)
                         }
                 ) {
-                    thumb?.let {
-                        Image(bitmap = it.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                    val safeT = thumb
+                    if (safeT != null && !safeT.isRecycled) {
+                        Image(bitmap = safeT.asImageBitmap(), contentDescription = null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
                     }
                 }
             }
         }
 
-        // Vista previa del Collage
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1024,9 +1085,10 @@ fun CollageStudioModal(
                 .background(Color.Black),
             contentAlignment = Alignment.Center
         ) {
-            if (collagePreview != null) {
+            val safeCollage = collagePreview
+            if (safeCollage != null && !safeCollage.isRecycled) {
                 Image(
-                    bitmap = collagePreview!!.asImageBitmap(),
+                    bitmap = safeCollage.asImageBitmap(),
                     contentDescription = "Collage Preview",
                     contentScale = ContentScale.Fit,
                     modifier = Modifier.fillMaxSize()
@@ -1038,9 +1100,8 @@ fun CollageStudioModal(
 
         Spacer(Modifier.height(8.dp))
 
-        // Selector de Formato de Cinta (8mm, 35mm, 75mm, 21:9, Película)
         LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(CollageTemplate.values()) { tpl ->
+            items(CollageTemplate.values().toList()) { tpl ->
                 FilterChip(
                     selected = selectedTemplate == tpl,
                     onClick = { selectedTemplate = tpl },
@@ -1049,7 +1110,6 @@ fun CollageStudioModal(
             }
         }
 
-        // Selector de Film para el Collage
         LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             items(BUILT_IN_PRESETS) { preset ->
                 FilterChip(
@@ -1064,23 +1124,25 @@ fun CollageStudioModal(
             onClick = {
                 val bmp = collagePreview ?: return@Button
                 scope.launch(Dispatchers.IO) {
-                    val values = ContentValues().apply {
-                        put(MediaStore.Images.Media.DISPLAY_NAME, "ANALOG_COLLAGE_${System.currentTimeMillis()}.jpg")
-                        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                            put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/AnalogPro")
+                    try {
+                        val values = ContentValues().apply {
+                            put(MediaStore.Images.Media.DISPLAY_NAME, "ANALOG_COLLAGE_${System.currentTimeMillis()}.jpg")
+                            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/AnalogPro")
+                            }
                         }
-                    }
-                    val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                    if (uri != null) {
-                        context.contentResolver.openOutputStream(uri)?.use { out ->
-                            bmp.compress(Bitmap.CompressFormat.JPEG, 100, out)
+                        val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                        if (uri != null) {
+                            context.contentResolver.openOutputStream(uri)?.use { out ->
+                                bmp.compress(Bitmap.CompressFormat.JPEG, 100, out)
+                            }
                         }
-                    }
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(context, "Collage guardado en Galería", Toast.LENGTH_SHORT).show()
-                        onSaved()
-                    }
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(context, "Collage guardado en Galería", Toast.LENGTH_SHORT).show()
+                            onSaved()
+                        }
+                    } catch (_: Throwable) {}
                 }
             },
             enabled = collagePreview != null,
